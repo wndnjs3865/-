@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "n8n": {
+      "url": "https://wndnjs3865.app.n8n.cloud/mcp-server/http",
+      "headers": {
+        "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlZTNhMWU0Yi1kZWZiLTRkNTEtOTk2Yy1mYmRmYzIyZmNiMDEiLCJpc3MiOiJuOG4iLCJhdWQiOiJtY3Atc2VydmVyLWFwaSIsImp0aSI6ImY2NGViZDg4LThjZTAtNDk0NS1iNDlmLTEwYTUwOGQ2ZDFiNiIsImlhdCI6MTc3NTEyMjIwNn0.pUptZ2ksDDRc5hhcqM30yWxd-VMKv9wLOYkDJ0DdvqM"
+      }
+    }
+  }
+}
