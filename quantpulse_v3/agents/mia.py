@@ -156,73 +156,148 @@ class MIAAgent(BaseAgent):
     # ── Multi-Source Data Gathering ────────────
 
     async def _gather_market_data(self, symbol: str) -> dict[str, Any]:
-        """
-        Gather intelligence from multiple sources.
-        In production, each section calls real APIs.
-        Currently returns structured placeholders that the analysis engine can consume.
-        """
+        """Gather market data — uses exchange OHLCV if available, else cached/injected."""
+        cached = self._market_data_cache.get(symbol, {})
+        price = cached.get("price", 0.0)
+
+        # Fetch real OHLCV from exchange if available
+        ohlcv_data: dict[str, list[dict[str, float]]] = {}
+        if self._exchange and self._exchange.is_connected:
+            ccxt_symbol = self._to_ccxt_symbol(symbol)
+            for tf in ["1d", "4h", "1h", "15m"]:
+                try:
+                    candles = await asyncio.wait_for(
+                        self._exchange.fetch_ohlcv(ccxt_symbol, tf, limit=50),
+                        timeout=10.0,
+                    )
+                    ohlcv_data[tf] = [
+                        {"t": c.timestamp, "o": c.open, "h": c.high,
+                         "l": c.low, "c": c.close, "v": c.volume}
+                        for c in candles
+                    ]
+                    if candles and price <= 0:
+                        price = candles[-1].close
+                except Exception as e:
+                    self.logger.debug(f"[MIA] OHLCV fetch failed {symbol}/{tf}: {e}")
+
+        # Compute SMC indicators from real candles
+        smc = self._compute_smc_from_ohlcv(ohlcv_data)
+
         data: dict[str, Any] = {
             "symbol": symbol,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            # Price data (would come from exchange websocket/REST)
-            "price": self._market_data_cache.get(symbol, {}).get("price", 0.0),
-            "ohlcv": {},  # tf → list of candles (Phase 4: exchange integration)
-            # SMC/ICT indicators (computed from price data)
-            "smc": {
-                "order_blocks": [],
-                "fair_value_gaps": [],
-                "liquidity_zones": [],
-                "break_of_structure": False,
-                "change_of_character": False,
-            },
-            # News & sentiment (would come from news API)
-            "sentiment": {
-                "score": 0.0,       # -1.0 (extreme fear) to 1.0 (extreme greed)
-                "source": "aggregated",
-                "headlines": [],
-                "fear_greed_index": 50,
-            },
-            # Macro indicators
-            "macro": {
-                "fed_rate_decision_near": False,
-                "cpi_release_near": False,
-                "geopolitical_risk": "LOW",
-                "dxy_trend": "NEUTRAL",
-            },
-            # On-chain data (crypto-specific)
-            "onchain": {
-                "funding_rate": 0.0,
-                "open_interest_change": 0.0,
-                "whale_flow": "NEUTRAL",
-                "exchange_netflow": 0.0,
-            },
-            # Trader psychology
-            "psychology": {
-                "fomo_level": 0.0,   # 0-1
-                "fud_level": 0.0,    # 0-1
-                "retail_positioning": "NEUTRAL",
-            },
+            "price": price,
+            "ohlcv": ohlcv_data,
+            "smc": smc,
+            "sentiment": cached.get("sentiment", {
+                "score": 0.0, "source": "aggregated",
+                "headlines": [], "fear_greed_index": 50,
+            }),
+            "macro": cached.get("macro", {
+                "fed_rate_decision_near": False, "cpi_release_near": False,
+                "geopolitical_risk": "LOW", "dxy_trend": "NEUTRAL",
+            }),
+            "onchain": cached.get("onchain", {
+                "funding_rate": 0.0, "open_interest_change": 0.0,
+                "whale_flow": "NEUTRAL", "exchange_netflow": 0.0,
+            }),
+            "psychology": cached.get("psychology", {
+                "fomo_level": 0.0, "fud_level": 0.0, "retail_positioning": "NEUTRAL",
+            }),
         }
         self._market_data_cache[symbol] = data
         return data
+
+    def _to_ccxt_symbol(self, symbol: str) -> str:
+        """Convert internal symbol (BTCUSDT) to CCXT futures format (BTC/USDT:USDT)."""
+        if "/" in symbol:
+            return symbol
+        base = symbol.replace("USDT", "")
+        return f"{base}/USDT:USDT"
+
+    def _compute_smc_from_ohlcv(self, ohlcv: dict[str, list[dict[str, float]]]) -> dict[str, Any]:
+        """Compute SMC/ICT indicators from real OHLCV candle data."""
+        result: dict[str, Any] = {
+            "order_blocks": [],
+            "fair_value_gaps": [],
+            "liquidity_zones": [],
+            "break_of_structure": False,
+            "change_of_character": False,
+        }
+        # Use highest-resolution available data
+        candles = ohlcv.get("1h") or ohlcv.get("4h") or ohlcv.get("1d") or []
+        if len(candles) < 5:
+            return result
+
+        # Detect swing highs/lows (simplified 3-bar pivot)
+        swing_highs: list[float] = []
+        swing_lows: list[float] = []
+        for i in range(1, len(candles) - 1):
+            if candles[i]["h"] > candles[i-1]["h"] and candles[i]["h"] > candles[i+1]["h"]:
+                swing_highs.append(candles[i]["h"])
+            if candles[i]["l"] < candles[i-1]["l"] and candles[i]["l"] < candles[i+1]["l"]:
+                swing_lows.append(candles[i]["l"])
+
+        # BOS: price breaks above most recent swing high (bullish) or below swing low (bearish)
+        if swing_highs and swing_lows:
+            last_close = candles[-1]["c"]
+            recent_high = swing_highs[-1]
+            recent_low = swing_lows[-1]
+            if last_close > recent_high:
+                result["break_of_structure"] = True
+            elif last_close < recent_low:
+                result["break_of_structure"] = True
+
+        # CHOCH: direction reversal — higher low after downtrend or lower high after uptrend
+        if len(swing_lows) >= 2 and len(swing_highs) >= 2:
+            if swing_lows[-1] > swing_lows[-2] and swing_highs[-1] < swing_highs[-2]:
+                result["change_of_character"] = True
+            elif swing_lows[-1] < swing_lows[-2] and swing_highs[-1] > swing_highs[-2]:
+                result["change_of_character"] = True
+
+        # FVG: gap between candle[i-1].high and candle[i+1].low (bullish)
+        for i in range(1, len(candles) - 1):
+            gap_up = candles[i+1]["l"] - candles[i-1]["h"]
+            gap_down = candles[i-1]["l"] - candles[i+1]["h"]
+            if gap_up > 0:
+                result["fair_value_gaps"].append({
+                    "type": "bullish", "low": candles[i-1]["h"], "high": candles[i+1]["l"],
+                })
+            elif gap_down > 0:
+                result["fair_value_gaps"].append({
+                    "type": "bearish", "low": candles[i+1]["h"], "high": candles[i-1]["l"],
+                })
+
+        # Order blocks: last bearish candle before a bullish BOS (simplified)
+        for i in range(2, len(candles)):
+            if candles[i]["c"] > candles[i-1]["h"] and candles[i-1]["c"] < candles[i-1]["o"]:
+                result["order_blocks"].append({
+                    "type": "bullish", "price": candles[i-1]["l"],
+                })
+            elif candles[i]["c"] < candles[i-1]["l"] and candles[i-1]["c"] > candles[i-1]["o"]:
+                result["order_blocks"].append({
+                    "type": "bearish", "price": candles[i-1]["h"],
+                })
+
+        # Liquidity zones: cluster of swing highs/lows
+        if swing_highs:
+            result["liquidity_zones"].append({"type": "sell_side", "price": max(swing_highs)})
+        if swing_lows:
+            result["liquidity_zones"].append({"type": "buy_side", "price": min(swing_lows)})
+
+        return result
 
     # ── SMC/ICT Structure Analysis ─────────────
 
     def _analyze_structure(
         self, symbol: str, tf: Timeframe, data: dict[str, Any]
     ) -> MarketStructureReport:
-        """
-        SMC/ICT market structure analysis for a single timeframe.
-        Detects: trend, BOS, CHOCH, order blocks, FVG, liquidity zones.
-        """
+        """SMC/ICT market structure analysis — computes trend from real OHLCV."""
         smc = data.get("smc", {})
-        sentiment = data.get("sentiment", {})
-        onchain = data.get("onchain", {})
+        ohlcv = data.get("ohlcv", {})
 
-        # In production, these are computed from actual OHLCV data.
-        # The structure is ready for real data integration.
-        trend_direction = Direction.NEUTRAL
-        trend_strength = 0.5
+        # Compute trend from candle data
+        trend_direction, trend_strength = self._compute_trend(ohlcv, tf)
         bos = smc.get("break_of_structure", False)
         choch = smc.get("change_of_character", False)
 
@@ -232,7 +307,7 @@ class MIAAgent(BaseAgent):
             regime=self._detect_regime_single(data),
             trend_direction=trend_direction,
             trend_strength=trend_strength,
-            key_levels=self._extract_key_levels(symbol, tf, data),
+            key_levels=self._extract_key_levels(ohlcv, tf),
             order_blocks=smc.get("order_blocks", []),
             fair_value_gaps=smc.get("fair_value_gaps", []),
             liquidity_zones=smc.get("liquidity_zones", []),
@@ -240,12 +315,59 @@ class MIAAgent(BaseAgent):
             change_of_character=choch,
         )
 
+    def _compute_trend(
+        self, ohlcv: dict[str, list[dict[str, float]]], tf: Timeframe
+    ) -> tuple[Direction, float]:
+        """Compute trend direction and strength from OHLCV candles."""
+        tf_key = tf.value  # "1d", "4h", "1h", "15m"
+        candles = ohlcv.get(tf_key, [])
+        if len(candles) < 10:
+            return Direction.NEUTRAL, 0.5
+
+        # Simple EMA crossover: fast(8) vs slow(21) on close prices
+        closes = [c["c"] for c in candles]
+        ema_fast = self._ema(closes, min(8, len(closes)))
+        ema_slow = self._ema(closes, min(21, len(closes)))
+
+        if ema_fast <= 0 or ema_slow <= 0:
+            return Direction.NEUTRAL, 0.5
+
+        spread = (ema_fast - ema_slow) / ema_slow
+        if spread > 0.001:
+            direction = Direction.LONG
+        elif spread < -0.001:
+            direction = Direction.SHORT
+        else:
+            direction = Direction.NEUTRAL
+
+        strength = min(1.0, abs(spread) * 50)  # Normalize to 0-1
+        return direction, round(max(0.1, strength), 2)
+
+    @staticmethod
+    def _ema(values: list[float], period: int) -> float:
+        """Compute EMA of the last `period` values."""
+        if not values or period <= 0:
+            return 0.0
+        k = 2.0 / (period + 1)
+        ema = values[0]
+        for v in values[1:]:
+            ema = v * k + ema * (1 - k)
+        return ema
+
     def _extract_key_levels(
-        self, symbol: str, tf: Timeframe, data: dict[str, Any]
+        self, ohlcv: dict[str, list[dict[str, float]]], tf: Timeframe
     ) -> list[float]:
-        """Extract support/resistance key levels."""
-        # Phase 4: compute from actual OHLCV data using swing high/low detection
-        return []
+        """Extract support/resistance from swing highs/lows."""
+        candles = ohlcv.get(tf.value, [])
+        if len(candles) < 5:
+            return []
+        levels: list[float] = []
+        for i in range(1, len(candles) - 1):
+            if candles[i]["h"] > candles[i-1]["h"] and candles[i]["h"] > candles[i+1]["h"]:
+                levels.append(round(candles[i]["h"], 2))
+            if candles[i]["l"] < candles[i-1]["l"] and candles[i]["l"] < candles[i+1]["l"]:
+                levels.append(round(candles[i]["l"], 2))
+        return sorted(set(levels))[-10:]  # Keep top 10
 
     # ── Bias & Confidence ──────────────────────
 
@@ -375,7 +497,8 @@ class MIAAgent(BaseAgent):
             return None
 
         # SL/TP calculation based on ATR-like volatility estimation
-        volatility_pct = 0.02  # 2% default (Phase 4: compute from real ATR)
+        # Compute ATR from candles if available, else use config default
+        volatility_pct = self._compute_atr_pct(data.get("ohlcv", {}))
 
         if direction == Direction.LONG:
             entry = price
@@ -451,15 +574,35 @@ class MIAAgent(BaseAgent):
 
     # ── Circuit Breaker ────────────────────────
 
+    def _compute_atr_pct(self, ohlcv: dict[str, list[dict[str, float]]]) -> float:
+        """Compute ATR as percentage from candle data, fallback to config default."""
+        candles = ohlcv.get("1h") or ohlcv.get("4h") or []
+        if len(candles) < 14:
+            return self.config.trading.default_volatility_pct
+        trs: list[float] = []
+        for i in range(1, len(candles)):
+            h, l, pc = candles[i]["h"], candles[i]["l"], candles[i-1]["c"]
+            tr = max(h - l, abs(h - pc), abs(l - pc))
+            trs.append(tr)
+        atr = sum(trs[-14:]) / 14
+        mid = candles[-1]["c"]
+        if mid <= 0:
+            return self.config.trading.default_volatility_pct
+        return max(0.005, min(0.10, atr / mid))  # Clamp 0.5%-10%
+
     async def _handle_circuit_breaker(self, message: Message) -> None:
         active = message.payload.get("active", True)
         if active:
             self.logger.warning("[MIA] Circuit breaker received, pausing signal generation")
-            self._analysis_interval = 300.0  # Slow down to 5min
+            self._analysis_interval = self.config.trading.analysis_interval * 5
         else:
-            self._analysis_interval = 60.0
+            self._analysis_interval = self.config.trading.analysis_interval
 
     # ── External API ───────────────────────────
+
+    def set_exchange(self, exchange: Any) -> None:
+        """Set exchange for fetching real OHLCV data."""
+        self._exchange = exchange
 
     def set_watchlist(self, symbols: list[str]) -> None:
         self._watchlist = symbols

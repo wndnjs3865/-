@@ -132,6 +132,20 @@ class BinanceFuturesExchange(BaseExchange):
             result = await self._exchange.create_order(
                 symbol, "market", side, amount, params=params
             )
+        elif order_type == "stop_market":
+            if price is None:
+                raise ValueError("Stop market order requires a stop price")
+            params["stopPrice"] = price
+            result = await self._exchange.create_order(
+                symbol, "STOP_MARKET", side, amount, None, params=params
+            )
+        elif order_type == "stop_limit":
+            if price is None:
+                raise ValueError("Stop limit order requires a price")
+            params["stopPrice"] = price
+            result = await self._exchange.create_order(
+                symbol, "STOP", side, amount, price, params=params
+            )
         else:
             if price is None:
                 raise ValueError("Limit order requires a price")

@@ -28,6 +28,13 @@ class TradingConfig:
     tp1_close_pct: float = 0.5      # Close 50% at TP1
     tp2_close_pct: float = 0.3      # Close 30% at TP2
     tp3_close_pct: float = 0.2      # Close 20% at TP3
+    # CRCO risk thresholds (previously hardcoded)
+    max_drawdown: float = 0.10           # 10% max drawdown
+    max_single_exposure: float = 0.20    # 20% per asset
+    max_consecutive_losses: int = 5
+    max_daily_trades: int = 20
+    max_portfolio_heat: float = 0.06     # 6% total risk
+    initial_capital: float = 10000.0     # Initial portfolio value
     # MIA analysis
     analysis_interval: float = 60.0  # Seconds between analysis cycles
     default_volatility_pct: float = 0.02  # 2% default ATR estimate
@@ -90,6 +97,12 @@ class Config:
                 slippage_bps=float(os.getenv("SLIPPAGE_BPS", "2.0")),
                 commission_rate=float(os.getenv("COMMISSION_RATE", "0.0004")),
                 trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "0.005")),
+                max_drawdown=float(os.getenv("MAX_DRAWDOWN", "0.10")),
+                max_single_exposure=float(os.getenv("MAX_SINGLE_EXPOSURE", "0.20")),
+                max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "5")),
+                max_daily_trades=int(os.getenv("MAX_DAILY_TRADES", "20")),
+                max_portfolio_heat=float(os.getenv("MAX_PORTFOLIO_HEAT", "0.06")),
+                initial_capital=float(os.getenv("INITIAL_CAPITAL", "10000.0")),
                 tp1_close_pct=float(os.getenv("TP1_CLOSE_PCT", "0.5")),
                 tp2_close_pct=float(os.getenv("TP2_CLOSE_PCT", "0.3")),
                 tp3_close_pct=float(os.getenv("TP3_CLOSE_PCT", "0.2")),

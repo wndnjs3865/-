@@ -37,10 +37,10 @@ class CRCOAgent(BaseAgent):
         self.config = config
 
         # ── Portfolio state (실시간 추적) ──
-        self._portfolio_value: float = 10000.0  # Initial capital (USD)
+        self._portfolio_value: float = config.trading.initial_capital
         self._daily_pnl: float = 0.0
-        self._daily_start_value: float = 10000.0
-        self._peak_value: float = 10000.0  # For drawdown calc
+        self._daily_start_value: float = config.trading.initial_capital
+        self._peak_value: float = config.trading.initial_capital
         self._open_positions: dict[str, dict[str, Any]] = {}  # symbol → position_info
         self._trade_history: list[TradeRecord] = []
         self._consecutive_losses: int = 0
@@ -205,7 +205,7 @@ class CRCOAgent(BaseAgent):
 
     def _check_03_max_drawdown(self) -> RiskValidation:
         """Check 3: 최대 낙폭(Drawdown) 체크."""
-        max_dd_threshold = 0.10  # 10% max drawdown
+        max_dd_threshold = self.config.trading.max_drawdown
         current_dd = (self._peak_value - self._portfolio_value) / max(self._peak_value, 1.0)
 
         if current_dd >= max_dd_threshold:
@@ -245,7 +245,7 @@ class CRCOAgent(BaseAgent):
 
     def _check_05_single_asset_exposure(self, signal: TradeSignal | None) -> RiskValidation:
         """Check 5: 단일 자산 노출 한도 (포트폴리오의 20% 이하)."""
-        max_single_exposure = 0.20
+        max_single_exposure = self.config.trading.max_single_exposure
         if not signal:
             return RiskValidation(check_name="single_asset_exposure", passed=True, detail="No signal")
 
@@ -313,7 +313,7 @@ class CRCOAgent(BaseAgent):
 
     def _check_08_consecutive_loss_limit(self) -> RiskValidation:
         """Check 8: 연속 손실 횟수 제한 (5회 이상이면 거래 중단)."""
-        max_consecutive = 5
+        max_consecutive = self.config.trading.max_consecutive_losses
         if self._consecutive_losses >= max_consecutive:
             return RiskValidation(
                 check_name="consecutive_loss_limit",
@@ -331,7 +331,7 @@ class CRCOAgent(BaseAgent):
 
     def _check_09_daily_trade_count(self) -> RiskValidation:
         """Check 9: 일일 최대 거래 횟수 제한."""
-        max_daily = 20
+        max_daily = self.config.trading.max_daily_trades
         if self._trades_today >= max_daily:
             return RiskValidation(
                 check_name="daily_trade_count",
@@ -349,7 +349,7 @@ class CRCOAgent(BaseAgent):
 
     def _check_10_portfolio_heat(self) -> RiskValidation:
         """Check 10: 포트폴리오 히트 (전체 오픈 포지션의 합산 리스크 비율)."""
-        max_heat = 0.06  # 6% max total risk across all positions
+        max_heat = self.config.trading.max_portfolio_heat
         total_risk = sum(
             pos.get("risk_pct", 0.0) for pos in self._open_positions.values()
         )
@@ -418,7 +418,7 @@ class CRCOAgent(BaseAgent):
             return 0.0
 
         position_size = risk_amount / sl_distance_pct
-        max_single = self._portfolio_value * 0.20  # 20% max single position
+        max_single = self._portfolio_value * self.config.trading.max_single_exposure
         return round(min(position_size, max_single), 2)
 
     # ── Risk Score Computation ─────────────────

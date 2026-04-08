@@ -89,6 +89,14 @@ class PaperExchange(BaseExchange):
         price: float | None = None,
     ) -> ExchangeOrder:
         """Simulate order execution with slippage."""
+        # Stop orders are stored but not executed immediately in paper mode
+        if order_type in ("stop_market", "stop_limit"):
+            return ExchangeOrder(
+                order_id=uuid.uuid4().hex[:12], symbol=symbol, side=side,
+                order_type=order_type, price=price or 0, amount=amount,
+                filled=0, status="open", timestamp=time.time(),
+            )
+
         current = self._prices.get(symbol, 0.0)
         if current <= 0 and price:
             current = price

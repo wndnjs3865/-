@@ -148,6 +148,9 @@ class IMAAgent(BaseAgent):
         TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID가 설정되어 있어야 작동함.
         """
         self._telegram_queue.append(text)
+        # P0#7: Prevent unbounded queue growth — keep last 100 messages
+        if len(self._telegram_queue) > 100:
+            self._telegram_queue = self._telegram_queue[-100:]
 
         if not self._telegram_enabled:
             self.logger.debug(f"[IMA] Telegram disabled, queued: {text[:80]}...")

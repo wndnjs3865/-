@@ -67,6 +67,8 @@ class ESAgent(BaseAgent):
 
     async def on_start(self) -> None:
         self.create_task(self._position_monitor_loop(), name="es_position_monitor")
+        # P0#5: Recover positions from exchange on restart
+        await self._recover_positions()
 
     # ── Main Order Handler ─────────────────────
 
@@ -188,7 +190,7 @@ class ESAgent(BaseAgent):
         # Set up trailing stop (activate after TP1 hit)
         self._trailing_stops[trade_id] = {
             "active": False,
-            "trail_pct": 0.005,  # 0.5% trailing distance
+            "trail_pct": self.config.trading.trailing_stop_pct,
             "activation_price": decision.take_profit_1,
             "trail_price": None,
         }
@@ -219,133 +221,162 @@ class ESAgent(BaseAgent):
         self._exchange = exchange
 
     async def _execute_live(self, decision: TradeDecision) -> None:
-        """Live mode: 실제 거래소 API를 통한 주문 실행."""
+        """Live mode: 거래소 API 주문 + retry + stop order 생성."""
         if not self._exchange:
-            self.logger.error("[ES] No exchange connector set — cannot execute live")
-            await self._publish_order_failed(
-                decision, "No exchange connector configured"
-            )
+            await self._publish_order_failed(decision, "No exchange connector configured")
             return
-
         if not self._exchange.is_connected:
-            self.logger.error("[ES] Exchange not connected")
             await self._publish_order_failed(decision, "Exchange not connected")
             return
 
-        order_id = ""
         trade_id = uuid.uuid4().hex[:12]
 
-        try:
-            # Set leverage
-            from exchanges.binance_futures import BinanceFuturesExchange
-            if isinstance(self._exchange, BinanceFuturesExchange):
-                await self._exchange.set_leverage(decision.symbol, int(decision.leverage))
-
-            # Determine side
+        # P0#6: Retry logic — wrap exchange call in retry_async
+        async def _do_order():
             side = "buy" if decision.direction == Direction.LONG else "sell"
-            order_type_str = "market" if decision.order_type == OrderType.MARKET else "limit"
-            price = None if order_type_str == "market" else decision.entry_price
-
-            # ── Submit order ──
-            submitted_result = OrderResult(
-                decision_id=decision.decision_id,
-                signal_id=decision.signal_id,
-                symbol=decision.symbol,
-                direction=decision.direction,
-                order_type=decision.order_type,
-                status=OrderStatus.SUBMITTED,
-                requested_price=decision.entry_price,
-                quantity=decision.position_size,
-                trade_mode=TradeMode.LIVE,
-                exchange=self._exchange.name,
+            ot = "market" if decision.order_type == OrderType.MARKET else "limit"
+            price = None if ot == "market" else decision.entry_price
+            return await asyncio.wait_for(
+                self._exchange.create_order(
+                    symbol=decision.symbol, side=side,
+                    order_type=ot, amount=decision.position_size, price=price,
+                ),
+                timeout=30.0,
             )
-            await self._publish_order_event("es.order_submitted", submitted_result)
 
-            # ── Execute on exchange ──
-            exchange_order = await self._exchange.create_order(
-                symbol=decision.symbol,
-                side=side,
-                order_type=order_type_str,
-                amount=decision.position_size,
-                price=price,
-            )
+        try:
+            # Set leverage (best-effort)
+            try:
+                await asyncio.wait_for(
+                    self._exchange.set_leverage(decision.symbol, int(decision.leverage)),
+                    timeout=10.0,
+                )
+            except Exception:
+                pass
+
+            await self._publish_order_event("es.order_submitted", OrderResult(
+                decision_id=decision.decision_id, signal_id=decision.signal_id,
+                symbol=decision.symbol, direction=decision.direction,
+                order_type=decision.order_type, status=OrderStatus.SUBMITTED,
+                requested_price=decision.entry_price, quantity=decision.position_size,
+                trade_mode=TradeMode.LIVE, exchange=self._exchange.name,
+            ))
+
+            exchange_order = await self.retry_async(_do_order, "live_order", max_retries=3)
 
             order_id = exchange_order.order_id
             filled_price = exchange_order.price
             filled_qty = exchange_order.filled
-            commission = filled_price * filled_qty * 0.0004  # Estimate
+            commission = filled_price * filled_qty * self.config.trading.commission_rate
 
-            # ── Publish filled ──
-            filled_result = OrderResult(
-                order_id=order_id,
-                decision_id=decision.decision_id,
-                signal_id=decision.signal_id,
-                symbol=decision.symbol,
-                direction=decision.direction,
-                order_type=decision.order_type,
-                status=OrderStatus.FILLED,
-                requested_price=decision.entry_price,
-                filled_price=filled_price,
-                quantity=decision.position_size,
-                filled_quantity=filled_qty,
-                commission=commission,
+            await self._publish_order_event("es.order_filled", OrderResult(
+                order_id=order_id, decision_id=decision.decision_id,
+                signal_id=decision.signal_id, symbol=decision.symbol,
+                direction=decision.direction, order_type=decision.order_type,
+                status=OrderStatus.FILLED, requested_price=decision.entry_price,
+                filled_price=filled_price, quantity=decision.position_size,
+                filled_quantity=filled_qty, commission=commission,
                 slippage=round(abs(filled_price - decision.entry_price), 8),
-                trade_mode=TradeMode.LIVE,
-                exchange=self._exchange.name,
-            )
-            await self._publish_order_event("es.order_filled", filled_result)
+                trade_mode=TradeMode.LIVE, exchange=self._exchange.name,
+            ))
 
-            # ── Register active trade ──
             self._open_trades[trade_id] = {
-                "trade_id": trade_id,
-                "order_id": order_id,
-                "decision_id": decision.decision_id,
-                "signal_id": decision.signal_id,
-                "symbol": decision.symbol,
-                "direction": decision.direction.value,
-                "entry_price": filled_price,
-                "quantity": filled_qty,
-                "stop_loss": decision.stop_loss,
-                "take_profit_1": decision.take_profit_1,
-                "take_profit_2": decision.take_profit_2,
-                "take_profit_3": decision.take_profit_3,
-                "leverage": decision.leverage,
-                "commission_entry": commission,
+                "trade_id": trade_id, "order_id": order_id,
+                "decision_id": decision.decision_id, "signal_id": decision.signal_id,
+                "symbol": decision.symbol, "direction": decision.direction.value,
+                "entry_price": filled_price, "quantity": filled_qty,
+                "stop_loss": decision.stop_loss, "take_profit_1": decision.take_profit_1,
+                "take_profit_2": decision.take_profit_2, "take_profit_3": decision.take_profit_3,
+                "leverage": decision.leverage, "commission_entry": commission,
                 "opened_at": datetime.now(timezone.utc).isoformat(),
-                "highest_price": filled_price,
-                "lowest_price": filled_price,
+                "highest_price": filled_price, "lowest_price": filled_price,
+                "tp1_closed": False, "tp2_closed": False,  # P1#11: partial TP tracking
+                "original_quantity": filled_qty,
+            }
+            self._trailing_stops[trade_id] = {
+                "active": False, "trail_pct": self.config.trading.trailing_stop_pct,
+                "activation_price": decision.take_profit_1, "trail_price": None,
             }
 
-            self._trailing_stops[trade_id] = {
-                "active": False,
-                "trail_pct": 0.005,
-                "activation_price": decision.take_profit_1,
-                "trail_price": None,
-            }
+            # P0#4: Place SL stop order on exchange for safety
+            await self._place_stop_order(decision.symbol, decision.direction, filled_qty, decision.stop_loss)
 
             await self.audit_log("live_order_filled", {
-                "trade_id": trade_id,
-                "order_id": order_id,
-                "symbol": decision.symbol,
-                "direction": decision.direction.value,
-                "filled_price": filled_price,
-                "quantity": filled_qty,
-                "exchange": self._exchange.name,
+                "trade_id": trade_id, "order_id": order_id,
+                "symbol": decision.symbol, "filled_price": filled_price,
+                "quantity": filled_qty, "exchange": self._exchange.name,
             })
-
             self.logger.info(
                 f"[ES] LIVE FILLED: {decision.symbol} {decision.direction.value} "
                 f"@ {filled_price} qty={filled_qty} via {self._exchange.name}"
             )
-
         except Exception as e:
             self.logger.error(f"[ES] Live execution failed: {e}")
             await self._publish_order_failed(decision, f"Exchange error: {e}")
-            await self.audit_log("live_order_error", {
-                "symbol": decision.symbol,
-                "error": str(e),
-                "order_id": order_id,
+
+    # ── P0#4: Stop Order on Exchange ───────────
+
+    async def _place_stop_order(
+        self, symbol: str, direction: Direction, qty: float, stop_price: float
+    ) -> None:
+        """Place a stop-market order on the exchange as SL protection."""
+        if not self._exchange or not self._exchange.is_connected:
+            return
+        try:
+            close_side = "sell" if direction == Direction.LONG else "buy"
+            await asyncio.wait_for(
+                self._exchange.create_order(
+                    symbol=symbol, side=close_side, order_type="stop_market",
+                    amount=qty, price=stop_price,
+                ),
+                timeout=10.0,
+            )
+            self.logger.info(f"[ES] SL stop order placed: {symbol} {close_side} @ {stop_price}")
+            await self.audit_log("stop_order_placed", {
+                "symbol": symbol, "side": close_side, "stop_price": stop_price, "qty": qty,
             })
+        except Exception as e:
+            self.logger.warning(f"[ES] Stop order failed (ES monitor will cover SL): {e}")
+
+    # ── P0#5: Position Recovery ────────────────
+
+    async def _recover_positions(self) -> None:
+        """On restart, sync open positions from exchange into internal state."""
+        if not self._exchange or not self._exchange.is_connected:
+            return
+        try:
+            positions = await asyncio.wait_for(
+                self._exchange.fetch_positions(), timeout=15.0,
+            )
+            for pos in positions:
+                symbol = pos.get("symbol", "")
+                amount = pos.get("amount", 0)
+                if amount <= 0:
+                    continue
+                trade_id = uuid.uuid4().hex[:12]
+                direction = "LONG" if pos.get("side") == "long" else "SHORT"
+                entry = pos.get("entry_price", 0)
+                self._open_trades[trade_id] = {
+                    "trade_id": trade_id, "order_id": "recovered",
+                    "decision_id": "recovered", "signal_id": "recovered",
+                    "symbol": symbol, "direction": direction,
+                    "entry_price": entry, "quantity": amount,
+                    "stop_loss": entry * (0.98 if direction == "LONG" else 1.02),
+                    "take_profit_1": entry * (1.04 if direction == "LONG" else 0.96),
+                    "take_profit_2": None, "take_profit_3": None,
+                    "leverage": pos.get("leverage", 1),
+                    "commission_entry": 0, "opened_at": datetime.now(timezone.utc).isoformat(),
+                    "highest_price": entry, "lowest_price": entry,
+                    "tp1_closed": False, "tp2_closed": False,
+                    "original_quantity": amount,
+                }
+                self.logger.info(f"[ES] Recovered position: {symbol} {direction} qty={amount} @ {entry}")
+                await self.audit_log("position_recovered", {
+                    "trade_id": trade_id, "symbol": symbol,
+                    "direction": direction, "entry": entry, "quantity": amount,
+                })
+        except Exception as e:
+            self.logger.warning(f"[ES] Position recovery failed: {e}")
 
     # ── Position Monitor Loop ──────────────────
 
@@ -368,7 +399,7 @@ class ESAgent(BaseAgent):
         self._price_feed[symbol] = price
 
     async def _check_sl_tp(self, trade_id: str) -> None:
-        """SL/TP/Trailing hit check using injected price feed."""
+        """SL/TP/Trailing check with partial take-profit support."""
         trade = self._open_trades.get(trade_id)
         if not trade:
             return
@@ -376,34 +407,85 @@ class ESAgent(BaseAgent):
         symbol = trade["symbol"]
         current_price = self._price_feed.get(symbol)
         if current_price is None or current_price <= 0:
-            return  # No price available yet
+            return
 
         direction = trade["direction"]
+        is_long = direction == Direction.LONG.value
+
+        self.update_trailing_stop(trade_id, current_price)
         sl = trade["stop_loss"]
+
+        # SL hit → close everything
+        if (is_long and current_price <= sl) or (not is_long and current_price >= sl):
+            await self.close_trade(trade_id, sl, reason="sl_hit")
+            return
+
         tp1 = trade["take_profit_1"]
         tp2 = trade.get("take_profit_2")
         tp3 = trade.get("take_profit_3")
 
-        # Update trailing stop
-        self.update_trailing_stop(trade_id, current_price)
-        # Re-read SL (may have been updated by trailing)
-        sl = trade["stop_loss"]
+        # P1#11: Partial TP — close configured percentage at each level
+        tp1_hit = (is_long and current_price >= tp1) or (not is_long and current_price <= tp1)
+        tp2_hit = tp2 and ((is_long and current_price >= tp2) or (not is_long and current_price <= tp2))
+        tp3_hit = tp3 and ((is_long and current_price >= tp3) or (not is_long and current_price <= tp3))
 
-        # Check SL hit
-        if direction == Direction.LONG.value and current_price <= sl:
-            await self.close_trade(trade_id, sl, reason="sl_hit")
-        elif direction == Direction.SHORT.value and current_price >= sl:
-            await self.close_trade(trade_id, sl, reason="sl_hit")
-        # Check TP3 hit (best exit)
-        elif tp3 and direction == Direction.LONG.value and current_price >= tp3:
+        if tp3_hit and not trade.get("tp2_closed"):
+            # TP3 before TP2 closed — close remaining
             await self.close_trade(trade_id, tp3, reason="tp3_hit")
-        elif tp3 and direction == Direction.SHORT.value and current_price <= tp3:
-            await self.close_trade(trade_id, tp3, reason="tp3_hit")
-        # Check TP1 hit (partial — for now full close)
-        elif direction == Direction.LONG.value and current_price >= tp1:
-            await self.close_trade(trade_id, tp1, reason="tp1_hit")
-        elif direction == Direction.SHORT.value and current_price <= tp1:
-            await self.close_trade(trade_id, tp1, reason="tp1_hit")
+        elif tp2_hit and not trade.get("tp2_closed"):
+            close_pct = self.config.trading.tp2_close_pct
+            await self._partial_close(trade_id, tp2, close_pct, "tp2_hit")
+            trade["tp2_closed"] = True
+        elif tp1_hit and not trade.get("tp1_closed"):
+            close_pct = self.config.trading.tp1_close_pct
+            await self._partial_close(trade_id, tp1, close_pct, "tp1_hit")
+            trade["tp1_closed"] = True
+
+    async def _partial_close(
+        self, trade_id: str, exit_price: float, close_pct: float, reason: str,
+    ) -> None:
+        """Close a fraction of a position (partial take-profit)."""
+        trade = self._open_trades.get(trade_id)
+        if not trade:
+            return
+        full_qty = trade["quantity"]
+        close_qty = round(full_qty * close_pct, 8)
+        if close_qty <= 0:
+            return
+
+        remaining = round(full_qty - close_qty, 8)
+        direction = trade["direction"]
+        entry = trade["entry_price"]
+
+        if direction == Direction.LONG.value:
+            raw_pnl = (exit_price - entry) * close_qty
+        else:
+            raw_pnl = (entry - exit_price) * close_qty
+
+        commission = round(exit_price * close_qty * self.config.trading.commission_rate, 4)
+        net_pnl = round(raw_pnl - commission, 4)
+
+        trade["quantity"] = remaining
+
+        payload = {
+            "order_id": trade.get("order_id", ""), "decision_id": trade["decision_id"],
+            "signal_id": trade["signal_id"], "symbol": trade["symbol"],
+            "direction": direction, "pnl": net_pnl,
+            "pnl_percent": round((net_pnl / (entry * close_qty)) * 100, 4) if entry * close_qty > 0 else 0,
+            "entry_price": entry, "exit_price": exit_price,
+            "quantity": close_qty, "remaining_quantity": remaining,
+            "close_reason": reason, "partial": True,
+        }
+        await self.publish(topic="es.order_closed", payload=payload, priority=Priority.HIGH)
+        await self.audit_log("partial_close", payload)
+        self.logger.info(
+            f"[ES] PARTIAL CLOSE: {trade['symbol']} {reason} "
+            f"closed={close_qty} remaining={remaining} PnL={net_pnl:+.2f}"
+        )
+
+        if remaining <= 0:
+            self._open_trades.pop(trade_id, None)
+            self._trailing_stops.pop(trade_id, None)
 
     async def close_trade(
         self,
@@ -428,7 +510,7 @@ class ESAgent(BaseAgent):
         else:
             raw_pnl = (entry - exit_price) * qty
 
-        commission_exit = round(exit_price * qty * 0.0004, 4)
+        commission_exit = round(exit_price * qty * self.config.trading.commission_rate, 4)
         total_commission = commission_entry + commission_exit
         net_pnl = round(raw_pnl - total_commission, 4)
         pnl_pct = round((net_pnl / (entry * qty)) * 100, 4) if entry * qty > 0 else 0.0
