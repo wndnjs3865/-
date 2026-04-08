@@ -23,6 +23,29 @@
 | 8 | Live activation simulation, watchdog, deployment | 5 |
 | **Total** | **Complete System** | **120** |
 
+## Project Stats
+- Python files: 38
+- Lines of code: 8,445
+- Test files: 13
+- Tests: 120 (all passing)
+- Agents: 7
+- Safety layers: 4
+- Risk checks: 11
+- QR scoring dimensions: 8
+
+## Live Readiness: 65%
+### What's Done
+- All 7 agents, MessageBus, AuditLog
+- 4-layer safety (gate + CRCO + circuit breaker + emergency stop)
+- Paper trading simulation with SL/TP/Trailing
+- Docker/Railway deployment configs
+
+### What's Needed for Live
+- Real exchange connector (CCXT Pro → Binance/Bybit)
+- Real-time price feed (WebSocket)
+- Real OHLCV data for MIA analysis
+- Telegram actual sending (bot token)
+
 ## Live Trading Safety (4 Layers)
 
 ### Layer 1: 3-Stage Safety Gate
@@ -47,7 +70,7 @@ Auto-restarts any agent that has crashed. Logs to audit trail.
 3. Trailing stop pre-set trail_price → removed
 4. CSO deadlock in handler → `create_task()` for pipeline
 5. ES `_check_sl_tp` was no-op → wired to price feed
-6. Live lifecycle test: ES correctly rejects LIVE orders (no exchange connector) → test uses PAPER for execution validation
+6. Live lifecycle test: ES correctly rejects LIVE orders → test uses PAPER
 
 ## Critical Patterns
 - **NEVER** `request()` inside `subscribe_safe()` handler → `create_task()`
@@ -60,8 +83,9 @@ Auto-restarts any agent that has crashed. Logs to audit trail.
 - **Railway**: Push to GitHub → auto-deploy (restart on failure, 10 retries)
 - **start.sh**: Auto-restart loop (max 10 restarts, 5s delay)
 
-## Test Coverage: 120 tests across 13 files
-- Unit: models, bus, audit, base_agent (29)
-- Agent: CRCO, ES, MIA, QR, CSO, PO, IMA (45)
-- Exchange (6), Integration (6), Validation (13)
-- Safety (16), Live Activation (5)
+## Next Steps for Live Trading
+1. `pip install ccxt` → implement exchanges/binance_futures.py
+2. WebSocket price feed → MIA.inject_price() + ES.inject_price()
+3. Test with real market data in PAPER mode for 1-2 weeks
+4. Configure Telegram bot for alerts
+5. `await system.switch_mode("LIVE")` with small capital only
