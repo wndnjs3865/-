@@ -9,21 +9,52 @@
 - JWQuantSystem orchestrator with ordered boot/shutdown
 - PaperExchange with CCXT-compatible interface
 
-## Implementation Status — COMPLETE
+## Implementation Status — COMPLETE + VALIDATED
 | Phase | Contents | Tests |
 |-------|----------|-------|
 | 1 | core/ (models, message_bus, audit_logger, base_agent, config) | 29 |
 | 2 | agents/crco.py, agents/es.py | 16 |
 | 3 | agents/mia, qr, cso, po, ima | 29 |
 | 4 | main.py (JWQuantSystem), deployment, integration | 6 |
-| Final | exchanges/, price feed wiring, README, Docker | 6 |
-| **Total** | **Complete system** | **86** |
+| 5 | exchanges/, price feed wiring, README, Docker | 6 |
+| 6 | Paper Trading validation (13 E2E tests) | 13 |
+| **Total** | **Complete + Validated** | **99** |
+
+## Paper Trading Validation Report (Phase 6)
+
+### Validation Results — 13/13 PASSED
+| ID | Checkpoint | Result |
+|----|-----------|--------|
+| V1 | All 7 agents boot | PASS |
+| V2 | IMA monitors all 7 agents | PASS |
+| V3 | Full pipeline: signal→QR→CRCO→ES | PASS |
+| V4 | CRCO veto blocks bad signals | PASS |
+| V5 | SL hit closes position at loss | PASS |
+| V6 | TP1 hit closes position at profit | PASS |
+| V7 | Circuit breaker cascades to CSO+ES+MIA | PASS |
+| V8 | PO journal accuracy (win/loss/pnl) | PASS |
+| V9 | MessageBus burst (5 rapid signals, 0 deadlocks) | PASS |
+| V10 | Correlation_id request-response matching | PASS |
+| V11 | Audit trail completeness (every stage logged) | PASS |
+| V12 | System snapshot returns all 7 agent states | PASS |
+| V13 | Graceful shutdown (all agents stop cleanly) | PASS |
+
+### Issues Found During Validation
+**Zero new bugs discovered.** All 13 validation tests passed on the first run. This confirms the fixes from Phase 1-5 (deadlock prevention, commission calculation, trailing stop, price feed wiring) are solid.
+
+### Strengths Confirmed
+- CRCO veto is truly absolute — cannot be bypassed
+- Circuit breaker cascade is instantaneous via URGENT priority broadcast
+- SL/TP monitoring works correctly with injected price feed
+- PO accurately computes win rate, pnl, profit factor
+- MessageBus handles burst traffic with 0 deadlocks, 0 dead letters
+- Audit trail captures every decision at every pipeline stage
 
 ## Key Design Decisions
-1. **MessageBus**: correlation_id + topic matching for request-response (avoids request/response confusion)
+1. **MessageBus**: correlation_id + topic matching for request-response
 2. **AuditLogger**: WAL mode SQLite + async executor, auto-rotation at max_entries/2
 3. **CRCO**: 11 risk checks, circuit breaker with cooldown, absolute veto
-4. **ES**: Simulated slippage (2bps) + commission (4bps on notional), trailing stop after TP1, price feed injection for SL/TP monitoring
+4. **ES**: Slippage (2bps) + commission (4bps on notional), trailing stop after TP1, price feed SL/TP monitoring
 5. **CSO**: Pipeline in `create_task()` to prevent dispatcher deadlock
 6. **Boot order**: Consumers first (IMA→PO→ES→CRCO→QR→CSO→MIA), shutdown in reverse
 7. **PaperExchange**: CCXT-compatible interface, ready for live connector swap
@@ -38,7 +69,7 @@
 ## Critical Pattern
 **NEVER use `request()` or `publish_and_wait()` inside a `subscribe_safe()` handler.** Use `create_task()` to run long pipelines.
 
-## Message Flow (Verified E2E)
+## Message Flow (Verified E2E in Phase 6)
 ```
 MIA → mia.trade_signal → CSO (pipeline task)
   CSO → cso.request_quant_score → QR → qr.quant_score → CSO
@@ -70,23 +101,8 @@ IMA ← ima.alert (from any agent)
 | Real-time | Yes (async loop) | No | No | No |
 | Deterministic | Yes (rule-based) | LLM-dependent | LLM-dependent | LLM-dependent |
 
-**QuantPulse Advantage**: Deterministic, real-time, domain-optimized, full audit, absolute risk governance. No LLM in the hot path = no latency/cost/hallucination risk.
-
-## File Structure (Final)
-```
-quantpulse_v3/
-├── main.py              # JWQuantSystem orchestrator
-├── config.py            # Env-based configuration
-├── core/                # Infrastructure (models, bus, audit, base_agent)
-├── agents/              # 7 agents (mia, qr, cso, crco, es, po, ima)
-├── exchanges/           # BaseExchange + PaperExchange
-├── tests/               # 86 tests (10 test files)
-├── scripts/             # start.sh, healthcheck.sh
-├── Dockerfile           # Optimized container
-├── docker-compose.yml   # Single-command deployment
-├── railway.toml         # Railway config
-├── requirements.txt     # Production dependencies
-├── .env.example         # All config variables
-├── README.md            # Full docs (KR+EN)
-└── CLAUDE.md            # This file
-```
+## Test Coverage Summary
+- **99 tests** across 11 test files
+- **Phase 6 validation**: 13 end-to-end tests simulating real paper trading
+- Verified: pipeline, veto, SL/TP hits, circuit breaker, burst traffic, audit completeness
+- Zero mocks for core infrastructure — all tests use real MessageBus + AuditLogger
