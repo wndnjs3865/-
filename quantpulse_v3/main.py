@@ -181,6 +181,122 @@ class JWQuantSystem:
 
         logger.info(f"[SHUTDOWN] QuantPulse v3 stopped cleanly. Uptime: {uptime}s")
 
+    # ── Live Mode Safety Gate ─────────────────
+
+    async def validate_live_readiness(self) -> dict[str, Any]:
+        """
+        Run CRCO's 3-stage safety gate before allowing live trading.
+        This MUST be called and pass before any live order is executed.
+        """
+        if not self.crco:
+            return {"passed": False, "blockers": ["System not started"]}
+
+        result = self.crco.run_pre_live_checklist()
+
+        if self.audit:
+            await self.audit.log(AuditEntry(
+                agent=AgentRole.CRCO,
+                action="live_readiness_check",
+                detail=result,
+            ))
+
+        if result["passed"]:
+            logger.info("[SAFETY] Live readiness check PASSED — all 3 gates clear")
+        else:
+            logger.warning(
+                f"[SAFETY] Live readiness check FAILED — "
+                f"{len(result['blockers'])} blockers: {result['blockers']}"
+            )
+
+        return result
+
+    async def emergency_stop(self) -> dict[str, Any]:
+        """
+        EMERGENCY STOP: Close all positions + activate circuit breaker + halt system.
+
+        Call this when:
+        - Manual panic button
+        - Unrecoverable error detected
+        - API key compromise suspected
+        """
+        logger.critical("[EMERGENCY] EMERGENCY STOP INITIATED")
+
+        result: dict[str, Any] = {"timestamp": datetime.now(timezone.utc).isoformat()}
+
+        # Step 1: Activate circuit breaker
+        if self.crco:
+            self.crco.set_circuit_breaker(True)
+            result["circuit_breaker"] = True
+
+        # Step 2: Close all ES positions
+        if self.es:
+            es_result = await self.es.emergency_stop()
+            result["es_emergency"] = es_result
+
+        # Step 3: Log
+        if self.audit:
+            await self.audit.log(AuditEntry(
+                agent=AgentRole.IMA,
+                action="emergency_stop",
+                detail=result,
+            ))
+
+        logger.critical(
+            f"[EMERGENCY] Stop complete. "
+            f"Positions closed: {result.get('es_emergency', {}).get('positions_closed', 0)}"
+        )
+        return result
+
+    async def switch_mode(self, new_mode: str) -> dict[str, Any]:
+        """
+        Safely switch between PAPER and LIVE mode.
+
+        PAPER → LIVE: Requires 3-stage safety gate pass.
+        LIVE → PAPER: Always allowed (safe direction).
+        """
+        old_mode = self.config.trading.mode
+        new_mode = new_mode.upper()
+
+        if new_mode not in ("PAPER", "LIVE"):
+            return {"success": False, "error": f"Invalid mode: {new_mode}"}
+
+        if old_mode == new_mode:
+            return {"success": True, "message": f"Already in {new_mode} mode"}
+
+        # LIVE → PAPER: always allowed
+        if new_mode == "PAPER":
+            self.config.trading.mode = "PAPER"
+            logger.info(f"[MODE] Switched {old_mode} → PAPER")
+            if self.audit:
+                await self.audit.log(AuditEntry(
+                    agent=AgentRole.IMA,
+                    action="mode_switch",
+                    detail={"from": old_mode, "to": "PAPER"},
+                ))
+            return {"success": True, "from": old_mode, "to": "PAPER"}
+
+        # PAPER → LIVE: requires safety gate
+        self.config.trading.mode = "LIVE"  # Temporarily set for gate check
+        gate_result = await self.validate_live_readiness()
+
+        if not gate_result["passed"]:
+            self.config.trading.mode = "PAPER"  # Revert
+            logger.warning("[MODE] Switch to LIVE blocked by safety gate")
+            return {
+                "success": False,
+                "error": "Safety gate failed",
+                "blockers": gate_result["blockers"],
+            }
+
+        logger.warning(f"[MODE] Switched {old_mode} → LIVE — REAL MONEY AT RISK")
+        if self.audit:
+            await self.audit.log(AuditEntry(
+                agent=AgentRole.IMA,
+                action="mode_switch",
+                detail={"from": old_mode, "to": "LIVE", "gate_result": gate_result},
+            ))
+        return {"success": True, "from": old_mode, "to": "LIVE", "gate_result": gate_result}
+
     # ── System Status ──────────────────────────
 
     @property

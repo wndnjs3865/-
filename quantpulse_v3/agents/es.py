@@ -493,6 +493,54 @@ class ESAgent(BaseAgent):
 
     # ── Query Methods ──────────────────────────
 
+    # ── Emergency Stop ──────────────────────────
+
+    async def emergency_stop(self) -> dict[str, Any]:
+        """
+        EMERGENCY STOP: Close all positions immediately + block new orders.
+
+        Used for:
+        - Manual panic button
+        - Pre-live safety procedure
+        - Catastrophic error recovery
+
+        Returns summary of all closed positions.
+        """
+        self._circuit_breaker_active = True
+        closed_trades: list[dict[str, Any]] = []
+        errors: list[str] = []
+
+        self.logger.critical("[ES] EMERGENCY STOP ACTIVATED — closing all positions")
+
+        for trade_id, trade in list(self._open_trades.items()):
+            try:
+                # Use entry price as fallback (no live feed guaranteed)
+                exit_price = self._price_feed.get(trade["symbol"], trade["entry_price"])
+                await self.close_trade(trade_id, exit_price, reason="emergency_stop")
+                closed_trades.append({
+                    "trade_id": trade_id,
+                    "symbol": trade["symbol"],
+                    "exit_price": exit_price,
+                })
+            except Exception as e:
+                errors.append(f"{trade_id}: {e}")
+                self.logger.error(f"[ES] Emergency close failed for {trade_id}: {e}")
+
+        result = {
+            "positions_closed": len(closed_trades),
+            "errors": len(errors),
+            "closed": closed_trades,
+            "error_details": errors,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        await self.audit_log("emergency_stop", result)
+        await self._emit_alert(AlertSeverity.FATAL, "EMERGENCY STOP", f"Closed {len(closed_trades)} positions")
+
+        return result
+
+    # ── Query Methods ──────────────────────────
+
     @property
     def open_trades(self) -> dict[str, dict[str, Any]]:
         return dict(self._open_trades)
