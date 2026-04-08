@@ -53,6 +53,9 @@ class ESAgent(BaseAgent):
         # ── Circuit breaker flag ──
         self._circuit_breaker_active: bool = False
 
+        # ── Price feed (injected by JWQuantSystem or tests) ──
+        self._price_feed: dict[str, float] = {}  # symbol → latest price
+
     # ── Lifecycle ──────────────────────────────
 
     async def setup_subscriptions(self) -> None:
@@ -232,15 +235,47 @@ class ESAgent(BaseAgent):
                 self.logger.error(f"[ES] Position monitor error: {e}")
             await asyncio.sleep(1.0)
 
+    def inject_price(self, symbol: str, price: float) -> None:
+        """Inject price for SL/TP monitoring (called by JWQuantSystem or tests)."""
+        self._price_feed[symbol] = price
+
     async def _check_sl_tp(self, trade_id: str) -> None:
-        """SL/TP/Trailing 히트 체크 (Paper mode에서는 시뮬레이션)."""
+        """SL/TP/Trailing hit check using injected price feed."""
         trade = self._open_trades.get(trade_id)
         if not trade:
             return
 
-        # NOTE: 실제 구현에서는 여기서 현재 시장 가격을 가져와야 함.
-        # Phase 3/4에서 MIA의 실시간 가격 피드와 연동 예정.
-        # 현재는 포지션 관리 구조만 완성, 실제 가격 체크는 feed 연동 시 활성화.
+        symbol = trade["symbol"]
+        current_price = self._price_feed.get(symbol)
+        if current_price is None or current_price <= 0:
+            return  # No price available yet
+
+        direction = trade["direction"]
+        sl = trade["stop_loss"]
+        tp1 = trade["take_profit_1"]
+        tp2 = trade.get("take_profit_2")
+        tp3 = trade.get("take_profit_3")
+
+        # Update trailing stop
+        self.update_trailing_stop(trade_id, current_price)
+        # Re-read SL (may have been updated by trailing)
+        sl = trade["stop_loss"]
+
+        # Check SL hit
+        if direction == Direction.LONG.value and current_price <= sl:
+            await self.close_trade(trade_id, sl, reason="sl_hit")
+        elif direction == Direction.SHORT.value and current_price >= sl:
+            await self.close_trade(trade_id, sl, reason="sl_hit")
+        # Check TP3 hit (best exit)
+        elif tp3 and direction == Direction.LONG.value and current_price >= tp3:
+            await self.close_trade(trade_id, tp3, reason="tp3_hit")
+        elif tp3 and direction == Direction.SHORT.value and current_price <= tp3:
+            await self.close_trade(trade_id, tp3, reason="tp3_hit")
+        # Check TP1 hit (partial — for now full close)
+        elif direction == Direction.LONG.value and current_price >= tp1:
+            await self.close_trade(trade_id, tp1, reason="tp1_hit")
+        elif direction == Direction.SHORT.value and current_price <= tp1:
+            await self.close_trade(trade_id, tp1, reason="tp1_hit")
 
     async def close_trade(
         self,
