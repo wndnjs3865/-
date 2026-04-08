@@ -84,8 +84,10 @@ class PriceFeed:
             await asyncio.sleep(self._interval)
 
     async def _fetch_and_distribute(self, symbol: str) -> None:
-        """Fetch one ticker and push to consumers."""
-        ticker = await self._exchange.fetch_ticker(symbol)
+        """Fetch one ticker and push to consumers (with timeout)."""
+        ticker = await asyncio.wait_for(
+            self._exchange.fetch_ticker(symbol), timeout=10.0,
+        )
         price = ticker.last
 
         if price <= 0:

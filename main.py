@@ -173,14 +173,15 @@ class JWQuantSystem:
             )
             await self._exchange.connect()
 
-            # Wire exchange to ES for live order execution
+            # Wire exchange to ES + MIA
             self.es.set_exchange(self._exchange)
+            self.mia.set_exchange(self._exchange)
 
             # Start price feed → MIA + ES
             self._price_feed = PriceFeed(
                 exchange=self._exchange,
                 symbols=["BTC/USDT:USDT", "ETH/USDT:USDT"],
-                interval=5.0,
+                interval=self.config.system.price_feed_interval,
             )
             self._price_feed.set_consumers(mia=self.mia, es=self.es)
             await self._price_feed.start()
