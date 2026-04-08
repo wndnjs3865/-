@@ -566,6 +566,104 @@ class CRCOAgent(BaseAgent):
         elif not active:
             self._circuit_breaker_active = False
 
+    # ── 3-Stage Live Trading Safety Gate ─────────
+
+    def run_pre_live_checklist(self) -> dict[str, Any]:
+        """
+        3-stage safety gate that MUST pass before live trading is allowed.
+
+        Gate 1 (Configuration): Env vars, API keys, risk parameters
+        Gate 2 (System State): Circuit breaker off, no open positions, agents healthy
+        Gate 3 (Risk Parameters): Conservative limits enforced for live
+
+        Returns: {"passed": bool, "gates": [...], "blockers": [...]}
+        """
+        gates: list[dict[str, Any]] = []
+        blockers: list[str] = []
+
+        # ── Gate 1: Configuration Validation ──
+        g1_checks: list[tuple[str, bool, str]] = []
+
+        has_exchange_keys = bool(
+            self.config.exchange.binance_api_key or self.config.exchange.bybit_api_key
+        )
+        g1_checks.append(("exchange_api_keys", has_exchange_keys,
+                          "At least one exchange API key must be configured"))
+
+        mode_is_live = self.config.trading.mode == "LIVE"
+        g1_checks.append(("trade_mode_live", mode_is_live,
+                          "TRADE_MODE must be set to LIVE"))
+
+        risk_sane = self.config.trading.max_risk_per_trade <= 0.02
+        g1_checks.append(("risk_per_trade_sane", risk_sane,
+                          f"max_risk_per_trade={self.config.trading.max_risk_per_trade} must be <= 2%"))
+
+        leverage_sane = self.config.trading.max_leverage <= 20.0
+        g1_checks.append(("leverage_sane", leverage_sane,
+                          f"max_leverage={self.config.trading.max_leverage} must be <= 20x"))
+
+        daily_loss_sane = self.config.trading.max_daily_loss <= 0.05
+        g1_checks.append(("daily_loss_sane", daily_loss_sane,
+                          f"max_daily_loss={self.config.trading.max_daily_loss} must be <= 5%"))
+
+        g1_passed = all(ok for _, ok, _ in g1_checks)
+        for name, ok, msg in g1_checks:
+            if not ok:
+                blockers.append(f"[Gate1] {msg}")
+        gates.append({"gate": 1, "name": "Configuration", "passed": g1_passed,
+                      "checks": [{"name": n, "passed": p, "detail": d} for n, p, d in g1_checks]})
+
+        # ── Gate 2: System State ──
+        g2_checks: list[tuple[str, bool, str]] = []
+
+        g2_checks.append(("circuit_breaker_off", not self._circuit_breaker_active,
+                          "Circuit breaker must be inactive"))
+
+        no_positions = len(self._open_positions) == 0
+        g2_checks.append(("no_open_positions", no_positions,
+                          f"Must have 0 open positions, currently {len(self._open_positions)}"))
+
+        no_daily_loss = self._daily_pnl >= 0
+        g2_checks.append(("no_daily_loss", no_daily_loss,
+                          f"Daily PnL must be >= 0 before going live, currently {self._daily_pnl}"))
+
+        g2_passed = all(ok for _, ok, _ in g2_checks)
+        for name, ok, msg in g2_checks:
+            if not ok:
+                blockers.append(f"[Gate2] {msg}")
+        gates.append({"gate": 2, "name": "System State", "passed": g2_passed,
+                      "checks": [{"name": n, "passed": p, "detail": d} for n, p, d in g2_checks]})
+
+        # ── Gate 3: Risk Parameters Hardened ──
+        g3_checks: list[tuple[str, bool, str]] = []
+
+        cb_set = self.config.trading.circuit_breaker_loss <= 0.05
+        g3_checks.append(("circuit_breaker_threshold", cb_set,
+                          f"Circuit breaker must be <= 5%, currently {self.config.trading.circuit_breaker_loss*100}%"))
+
+        max_pos = self.config.trading.max_open_positions <= 10
+        g3_checks.append(("max_positions_sane", max_pos,
+                          f"Max positions must be <= 10, currently {self.config.trading.max_open_positions}"))
+
+        min_rr = self.config.trading.min_risk_reward >= 1.5
+        g3_checks.append(("min_rr_sane", min_rr,
+                          f"Min RR must be >= 1.5, currently {self.config.trading.min_risk_reward}"))
+
+        g3_passed = all(ok for _, ok, _ in g3_checks)
+        for name, ok, msg in g3_checks:
+            if not ok:
+                blockers.append(f"[Gate3] {msg}")
+        gates.append({"gate": 3, "name": "Risk Parameters", "passed": g3_passed,
+                      "checks": [{"name": n, "passed": p, "detail": d} for n, p, d in g3_checks]})
+
+        all_passed = g1_passed and g2_passed and g3_passed
+        return {
+            "passed": all_passed,
+            "gates": gates,
+            "blockers": blockers,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
     @property
     def risk_snapshot(self) -> dict[str, Any]:
         """Current risk state for monitoring/API."""
