@@ -50,10 +50,12 @@ class MIAAgent(BaseAgent):
         super().__init__(AgentRole.MIA, bus, audit)
         self.config = config
         self._watchlist: list[str] = ["BTCUSDT", "ETHUSDT"]
-        self._analysis_interval: float = 60.0  # seconds between analysis cycles
+        self._analysis_interval: float = config.trading.analysis_interval
         self._latest_analyses: dict[str, MultiTimeframeAnalysis] = {}
         self._market_data_cache: dict[str, dict[str, Any]] = {}
         self._signal_count: int = 0
+        # Exchange reference for fetching real OHLCV (injected by JWQuantSystem)
+        self._exchange: Any | None = None
 
     async def setup_subscriptions(self) -> None:
         self.subscribe_safe("crco.circuit_breaker", self._handle_circuit_breaker)

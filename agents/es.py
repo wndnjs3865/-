@@ -112,16 +112,16 @@ class ESAgent(BaseAgent):
         order_id = uuid.uuid4().hex[:12]
         trade_id = uuid.uuid4().hex[:12]
 
-        # Simulate market fill with small slippage
-        slippage_bps = 2  # 0.02% slippage
+        # Simulate market fill with configurable slippage
+        slippage_bps = self.config.trading.slippage_bps
         slippage_mult = 1.0 + (slippage_bps / 10000) * (
             1 if decision.direction == Direction.LONG else -1
         )
         filled_price = round(decision.entry_price * slippage_mult, 8)
         slippage = round(abs(filled_price - decision.entry_price), 8)
 
-        # Simulate commission (0.04% taker fee on notional value)
-        commission_rate = 0.0004
+        # Simulate commission (configurable taker fee on notional value)
+        commission_rate = self.config.trading.commission_rate
         notional_value = filled_price * decision.position_size
         commission = round(notional_value * commission_rate, 4)
 
