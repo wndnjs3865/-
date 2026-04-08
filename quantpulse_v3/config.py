@@ -49,6 +49,7 @@ class ExchangeConfig:
     bybit_api_secret: str = ""
     alpaca_api_key: str = ""
     alpaca_api_secret: str = ""
+    testnet: bool = False  # Use testnet/sandbox mode
 
 
 @dataclass
@@ -116,6 +117,7 @@ class Config:
                 bybit_api_secret=os.getenv("BYBIT_API_SECRET", ""),
                 alpaca_api_key=os.getenv("ALPACA_API_KEY", ""),
                 alpaca_api_secret=os.getenv("ALPACA_API_SECRET", ""),
+                testnet=os.getenv("EXCHANGE_TESTNET", "false").lower() == "true",
             ),
             notification=NotificationConfig(
                 telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
