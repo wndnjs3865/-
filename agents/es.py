@@ -56,6 +56,9 @@ class ESAgent(BaseAgent):
         # ── Price feed (injected by JWQuantSystem or tests) ──
         self._price_feed: dict[str, float] = {}  # symbol → latest price
 
+        # ── Live exchange connector (injected by JWQuantSystem) ──
+        self._exchange: Any | None = None  # BaseExchange instance
+
     # ── Lifecycle ──────────────────────────────
 
     async def setup_subscriptions(self) -> None:
@@ -209,15 +212,140 @@ class ESAgent(BaseAgent):
             f"SL={decision.stop_loss} TP1={decision.take_profit_1}"
         )
 
-    # ── Live Execution (Phase 4 placeholder) ───
+    # ── Live Execution ──────────────────────────
+
+    def set_exchange(self, exchange: Any) -> None:
+        """Set the live exchange connector (called by JWQuantSystem)."""
+        self._exchange = exchange
 
     async def _execute_live(self, decision: TradeDecision) -> None:
-        """Live mode: 실제 거래소 API를 통한 주문 실행 (Phase 4에서 구현)."""
-        # Phase 4에서 exchanges/binance_futures.py, exchanges/bybit_futures.py 연동
-        self.logger.warning("[ES] Live execution not yet implemented (Phase 4)")
-        await self._publish_order_failed(
-            decision, "Live execution not implemented yet (Phase 4)"
-        )
+        """Live mode: 실제 거래소 API를 통한 주문 실행."""
+        if not self._exchange:
+            self.logger.error("[ES] No exchange connector set — cannot execute live")
+            await self._publish_order_failed(
+                decision, "No exchange connector configured"
+            )
+            return
+
+        if not self._exchange.is_connected:
+            self.logger.error("[ES] Exchange not connected")
+            await self._publish_order_failed(decision, "Exchange not connected")
+            return
+
+        order_id = ""
+        trade_id = uuid.uuid4().hex[:12]
+
+        try:
+            # Set leverage
+            from exchanges.binance_futures import BinanceFuturesExchange
+            if isinstance(self._exchange, BinanceFuturesExchange):
+                await self._exchange.set_leverage(decision.symbol, int(decision.leverage))
+
+            # Determine side
+            side = "buy" if decision.direction == Direction.LONG else "sell"
+            order_type_str = "market" if decision.order_type == OrderType.MARKET else "limit"
+            price = None if order_type_str == "market" else decision.entry_price
+
+            # ── Submit order ──
+            submitted_result = OrderResult(
+                decision_id=decision.decision_id,
+                signal_id=decision.signal_id,
+                symbol=decision.symbol,
+                direction=decision.direction,
+                order_type=decision.order_type,
+                status=OrderStatus.SUBMITTED,
+                requested_price=decision.entry_price,
+                quantity=decision.position_size,
+                trade_mode=TradeMode.LIVE,
+                exchange=self._exchange.name,
+            )
+            await self._publish_order_event("es.order_submitted", submitted_result)
+
+            # ── Execute on exchange ──
+            exchange_order = await self._exchange.create_order(
+                symbol=decision.symbol,
+                side=side,
+                order_type=order_type_str,
+                amount=decision.position_size,
+                price=price,
+            )
+
+            order_id = exchange_order.order_id
+            filled_price = exchange_order.price
+            filled_qty = exchange_order.filled
+            commission = filled_price * filled_qty * 0.0004  # Estimate
+
+            # ── Publish filled ──
+            filled_result = OrderResult(
+                order_id=order_id,
+                decision_id=decision.decision_id,
+                signal_id=decision.signal_id,
+                symbol=decision.symbol,
+                direction=decision.direction,
+                order_type=decision.order_type,
+                status=OrderStatus.FILLED,
+                requested_price=decision.entry_price,
+                filled_price=filled_price,
+                quantity=decision.position_size,
+                filled_quantity=filled_qty,
+                commission=commission,
+                slippage=round(abs(filled_price - decision.entry_price), 8),
+                trade_mode=TradeMode.LIVE,
+                exchange=self._exchange.name,
+            )
+            await self._publish_order_event("es.order_filled", filled_result)
+
+            # ── Register active trade ──
+            self._open_trades[trade_id] = {
+                "trade_id": trade_id,
+                "order_id": order_id,
+                "decision_id": decision.decision_id,
+                "signal_id": decision.signal_id,
+                "symbol": decision.symbol,
+                "direction": decision.direction.value,
+                "entry_price": filled_price,
+                "quantity": filled_qty,
+                "stop_loss": decision.stop_loss,
+                "take_profit_1": decision.take_profit_1,
+                "take_profit_2": decision.take_profit_2,
+                "take_profit_3": decision.take_profit_3,
+                "leverage": decision.leverage,
+                "commission_entry": commission,
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+                "highest_price": filled_price,
+                "lowest_price": filled_price,
+            }
+
+            self._trailing_stops[trade_id] = {
+                "active": False,
+                "trail_pct": 0.005,
+                "activation_price": decision.take_profit_1,
+                "trail_price": None,
+            }
+
+            await self.audit_log("live_order_filled", {
+                "trade_id": trade_id,
+                "order_id": order_id,
+                "symbol": decision.symbol,
+                "direction": decision.direction.value,
+                "filled_price": filled_price,
+                "quantity": filled_qty,
+                "exchange": self._exchange.name,
+            })
+
+            self.logger.info(
+                f"[ES] LIVE FILLED: {decision.symbol} {decision.direction.value} "
+                f"@ {filled_price} qty={filled_qty} via {self._exchange.name}"
+            )
+
+        except Exception as e:
+            self.logger.error(f"[ES] Live execution failed: {e}")
+            await self._publish_order_failed(decision, f"Exchange error: {e}")
+            await self.audit_log("live_order_error", {
+                "symbol": decision.symbol,
+                "error": str(e),
+                "order_id": order_id,
+            })
 
     # ── Position Monitor Loop ──────────────────
 

@@ -65,6 +65,10 @@ class JWQuantSystem:
         self.audit: AuditLogger | None = None
         self.bus: MessageBus | None = None
 
+        # Exchange + Price Feed
+        self._exchange: Any | None = None
+        self._price_feed: Any | None = None
+
         # Agents (initialized in start)
         self.mia: MIAAgent | None = None
         self.qr: QRAgent | None = None
@@ -126,6 +130,9 @@ class JWQuantSystem:
         for agent in self._agents:
             self.ima.register_agent(agent)
 
+        # ── Step 5: Connect exchange + price feed (if API keys present) ──
+        await self._init_exchange()
+
         self._running = True
 
         # ── Audit system boot ──
@@ -145,14 +152,66 @@ class JWQuantSystem:
         logger.info(f"  Monitor:  IMA (health every {self.config.system.health_check_interval}s)")
         logger.info("=" * 58)
 
+    # ── Exchange Init ─────────────────────────
+
+    async def _init_exchange(self) -> None:
+        """Initialize exchange connector and price feed if API keys are configured."""
+        api_key = self.config.exchange.binance_api_key
+        api_secret = self.config.exchange.binance_api_secret
+
+        if not api_key or not api_secret:
+            logger.info("[BOOT] No exchange API keys — running in Paper-only mode")
+            return
+
+        try:
+            from exchanges.binance_futures import BinanceFuturesExchange
+            from core.price_feed import PriceFeed
+
+            self._exchange = BinanceFuturesExchange(
+                api_key=api_key,
+                api_secret=api_secret,
+            )
+            await self._exchange.connect()
+
+            # Wire exchange to ES for live order execution
+            self.es.set_exchange(self._exchange)
+
+            # Start price feed → MIA + ES
+            self._price_feed = PriceFeed(
+                exchange=self._exchange,
+                symbols=["BTC/USDT:USDT", "ETH/USDT:USDT"],
+                interval=5.0,
+            )
+            self._price_feed.set_consumers(mia=self.mia, es=self.es)
+            await self._price_feed.start()
+
+            logger.info("[BOOT] Exchange connected + price feed started")
+        except Exception as e:
+            logger.warning(f"[BOOT] Exchange init failed (Paper mode continues): {e}")
+            self._exchange = None
+            self._price_feed = None
+
     # ── Stop ───────────────────────────────────
 
     async def stop(self) -> None:
-        """Graceful shutdown: agents → bus → audit."""
+        """Graceful shutdown: price feed → agents → bus → audit."""
         if not self._running:
             return
         self._running = False
         logger.info("[SHUTDOWN] Stopping system...")
+
+        # Stop price feed first
+        if self._price_feed:
+            await self._price_feed.stop()
+            logger.info("[SHUTDOWN] Price feed stopped")
+
+        # Disconnect exchange
+        if self._exchange:
+            try:
+                await self._exchange.disconnect()
+                logger.info("[SHUTDOWN] Exchange disconnected")
+            except Exception as e:
+                logger.error(f"[SHUTDOWN] Exchange disconnect error: {e}")
 
         # Stop agents in reverse boot order
         for agent in reversed(self._agents):
