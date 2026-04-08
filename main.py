@@ -91,7 +91,8 @@ class JWQuantSystem:
         """Boot full system: infrastructure → agents → monitoring."""
         self._start_time = time.time()
         logger.info(BANNER)
-        logger.info(f"  Mode: {self.config.trading.mode}")
+        net = "TESTNET" if self.config.exchange.testnet else "MAINNET"
+        logger.info(f"  Mode: {self.config.trading.mode} | Network: {net}")
         logger.info(f"  Risk/Trade: {self.config.trading.max_risk_per_trade*100:.1f}%")
         logger.info(f"  Max Leverage: {self.config.trading.max_leverage}x")
         logger.info(f"  Circuit Breaker: {self.config.trading.circuit_breaker_loss*100:.1f}%")
@@ -167,9 +168,11 @@ class JWQuantSystem:
             from exchanges.binance_futures import BinanceFuturesExchange
             from core.price_feed import PriceFeed
 
+            is_testnet = self.config.exchange.testnet
             self._exchange = BinanceFuturesExchange(
                 api_key=api_key,
                 api_secret=api_secret,
+                testnet=is_testnet,
             )
             await self._exchange.connect()
 
