@@ -299,6 +299,35 @@ class JWQuantSystem:
 
     # ── System Status ──────────────────────────
 
+    # ── Agent Watchdog ──────────────────────────
+
+    async def start_watchdog(self, interval: int = 60) -> None:
+        """Start background watchdog that monitors agent health and auto-restarts."""
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog_loop(interval), name="system_watchdog"
+        )
+
+    async def _watchdog_loop(self, interval: int) -> None:
+        """Periodically check all agents and restart any that have crashed."""
+        while self._running:
+            for agent in self._agents:
+                if not agent.is_running and self._running:
+                    logger.warning(f"[WATCHDOG] {agent.role.value} is down — restarting")
+                    try:
+                        await agent.start()
+                        logger.info(f"[WATCHDOG] {agent.role.value} restarted successfully")
+                        if self.audit:
+                            await self.audit.log(AuditEntry(
+                                agent=AgentRole.IMA,
+                                action="agent_auto_restarted",
+                                detail={"agent": agent.role.value},
+                            ))
+                    except Exception as e:
+                        logger.error(f"[WATCHDOG] Failed to restart {agent.role.value}: {e}")
+            await asyncio.sleep(interval)
+
+    # ── System Status ──────────────────────────
+
     @property
     def system_snapshot(self) -> dict[str, Any]:
         """Full system status for API / monitoring."""
