@@ -20,6 +20,17 @@ class TradingConfig:
     max_correlation: float = 0.7
     circuit_breaker_loss: float = 0.05  # 5% triggers circuit breaker
     circuit_breaker_cooldown: int = 3600  # 1 hour cooldown
+    # Execution parameters (previously hardcoded)
+    slippage_bps: float = 2.0        # Paper mode slippage in basis points
+    commission_rate: float = 0.0004  # 0.04% taker fee
+    trailing_stop_pct: float = 0.005 # 0.5% trailing distance
+    # Partial take-profit ratios (TP1/TP2/TP3)
+    tp1_close_pct: float = 0.5      # Close 50% at TP1
+    tp2_close_pct: float = 0.3      # Close 30% at TP2
+    tp3_close_pct: float = 0.2      # Close 20% at TP3
+    # MIA analysis
+    analysis_interval: float = 60.0  # Seconds between analysis cycles
+    default_volatility_pct: float = 0.02  # 2% default ATR estimate
 
 
 @dataclass
@@ -50,6 +61,7 @@ class SystemConfig:
     health_check_interval: int = 30  # seconds
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    price_feed_interval: float = 5.0  # seconds
 
 
 @dataclass
@@ -75,6 +87,14 @@ class Config:
                 min_risk_reward=float(os.getenv("MIN_RISK_REWARD", "2.0")),
                 circuit_breaker_loss=float(os.getenv("CIRCUIT_BREAKER_LOSS", "0.05")),
                 circuit_breaker_cooldown=int(os.getenv("CIRCUIT_BREAKER_COOLDOWN", "3600")),
+                slippage_bps=float(os.getenv("SLIPPAGE_BPS", "2.0")),
+                commission_rate=float(os.getenv("COMMISSION_RATE", "0.0004")),
+                trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "0.005")),
+                tp1_close_pct=float(os.getenv("TP1_CLOSE_PCT", "0.5")),
+                tp2_close_pct=float(os.getenv("TP2_CLOSE_PCT", "0.3")),
+                tp3_close_pct=float(os.getenv("TP3_CLOSE_PCT", "0.2")),
+                analysis_interval=float(os.getenv("ANALYSIS_INTERVAL", "60.0")),
+                default_volatility_pct=float(os.getenv("DEFAULT_VOLATILITY_PCT", "0.02")),
             ),
             exchange=ExchangeConfig(
                 binance_api_key=os.getenv("BINANCE_API_KEY", ""),
@@ -94,5 +114,6 @@ class Config:
                 audit_db_path=os.getenv("AUDIT_DB_PATH", "data/audit.db"),
                 api_host=os.getenv("API_HOST", "0.0.0.0"),
                 api_port=int(os.getenv("API_PORT", "8000")),
+                price_feed_interval=float(os.getenv("PRICE_FEED_INTERVAL", "5.0")),
             ),
         )
