@@ -51,6 +51,7 @@ class IMAAgent(BaseAgent):
         # Telegram state
         self._telegram_enabled = config.notification.enable_telegram
         self._telegram_queue: list[str] = []
+        self._telegram_sent: int = 0
 
     async def setup_subscriptions(self) -> None:
         self.subscribe_safe("ima.alert", self._handle_alert)
@@ -141,7 +142,11 @@ class IMAAgent(BaseAgent):
     # ── Telegram ───────────────────────────────
 
     async def _send_telegram(self, text: str) -> None:
-        """Send a Telegram notification (actual sending in Phase 5)."""
+        """Send a Telegram notification.
+
+        쉬운 설명: 중요한 일이 생기면 텔레그램 앱으로 메시지를 보냄.
+        TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID가 설정되어 있어야 작동함.
+        """
         self._telegram_queue.append(text)
 
         if not self._telegram_enabled:
@@ -153,13 +158,30 @@ class IMAAgent(BaseAgent):
         if not token or not chat_id:
             return
 
-        # Phase 5: actual HTTP request via aiohttp
-        # async with aiohttp.ClientSession() as session:
-        #     await session.post(
-        #         f"https://api.telegram.org/bot{token}/sendMessage",
-        #         json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-        #     )
-        self.logger.info(f"[IMA] Telegram notification queued: {text[:80]}...")
+        try:
+            import urllib.request
+            import json as _json
+
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = _json.dumps({
+                "chat_id": chat_id,
+                "text": text[:4000],  # Telegram limit
+                "parse_mode": "HTML",
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+
+            # Run in executor to avoid blocking the event loop
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, urllib.request.urlopen, req)
+
+            self._telegram_sent += 1
+            self.logger.info(f"[IMA] Telegram sent: {text[:60]}...")
+        except Exception as e:
+            self.logger.warning(f"[IMA] Telegram send failed: {e}")
 
     # ── Alert Management ───────────────────────
 
